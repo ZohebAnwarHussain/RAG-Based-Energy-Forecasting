@@ -1,0 +1,54 @@
+# Modern Python project configuration
+# Centralises settings for code quality tools so all developers work with
+# identical formatting, linting, and testing rules.
+
+[tool.black]
+line-length = 79
+target-version = ["py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 79
+known_first_party = ["src", "config"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+[tool.flake8]
+max-line-length = 79
+extend-ignore = [
+    "E203",  # Whitespace before ':' — conflicts with black
+    "W503",  # Line break before binary operator — conflicts with black
+]
+exclude = [
+    ".git",
+    "__pycache__",
+    "thesis_env",
+    "build",
+    "dist",
+    ".ipynb_checkpoints",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
