@@ -34,8 +34,8 @@ Collection name:
 
 from __future__ import annotations
 
-import shutil
 import logging
+import chromadb
 from pathlib import Path
 from typing import List
 
@@ -48,69 +48,65 @@ logger = logging.getLogger(__name__)
 # Single collection name used for all KB summaries
 COLLECTION_NAME: str = "energy_kb"
 
-def clean_metadata(metadata: dict) -> dict:
-    """Chroma accepts only simple metadata types."""
-    clean = {}
-    for k, v in metadata.items():
-        if v is None:
-            clean[k] = ""
-        elif isinstance(v, (str, int, float, bool)):
-            clean[k] = v
-        else:
-            clean[k] = str(v)
-    return clean
 
 def build_chroma_index(
     documents: List[Document],
     embeddings: HuggingFaceEmbeddings,
     persist_dir: Path,
-    batch_size: int = 25,
-    reset_index: bool = True,
 ) -> Chroma:
+    """Build a ChromaDB collection from KB documents and persist to disk.
 
+    Embeds all document page_content strings, stores them alongside
+    their full metadata dicts in a single ChromaDB collection named
+    ``energy_kb``. The collection is automatically persisted to
+    ``persist_dir`` as a SQLite-backed directory.
+
+    Args:
+        documents: List of LangChain Document objects from
+            load_kb_documents(). Each document's metadata dict is
+            stored in ChromaDB for filtered retrieval.
+        embeddings: Configured HuggingFaceEmbeddings instance from
+            get_embeddings_model().
+        persist_dir: Directory path where ChromaDB will persist the
+            collection. Created if it does not exist.
+
+    Returns:
+        Built Chroma vector store instance, ready for .as_retriever()
+        or .similarity_search() calls with optional metadata filters.
+
+    Example:
+        >>> chroma_vs = build_chroma_index(docs, embeddings, Path("indexes/chromadb"))
+        >>> results = chroma_vs.similarity_search(
+        ...     "peak winter demand",
+        ...     k=5,
+        ...     filter={"dataset": "gefcom", "season": "Winter"},
+        ... )
+        >>> len(results)
+        5
+    """
     logger.info(
-        "Building ChromaDB collection '%s' from %d documents in batches...",
-        COLLECTION_NAME, len(documents)
+        "Building ChromaDB collection '%s' from %d documents...",
+        COLLECTION_NAME, len(documents),
     )
-
-    if reset_index and persist_dir.exists():
-        shutil.rmtree(persist_dir)
 
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    cleaned_docs = [
-        Document(
-            page_content=str(doc.page_content),
-            metadata=clean_metadata(doc.metadata)
-        )
-        for doc in documents
-        if doc.page_content and str(doc.page_content).strip()
-    ]
+    client = chromadb.Client()
 
-    vector_store = Chroma(
+    vector_store = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings,
+        client=client,
         collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=str(persist_dir),
     )
-
-    for start in range(0, len(cleaned_docs), batch_size):
-        batch = cleaned_docs[start:start + batch_size]
-
-        logger.info(
-            "Adding documents %d to %d of %d",
-            start + 1,
-            min(start + batch_size, len(cleaned_docs)),
-            len(cleaned_docs)
-        )
-
-        vector_store.add_documents(batch)
 
     logger.info(
-        "ChromaDB collection '%s' built successfully. Documents indexed: %d",
-        COLLECTION_NAME,
-        len(cleaned_docs)
+        "ChromaDB collection '%s' built and persisted to %s. "
+        "Documents indexed: %d. "
+        "Metadata fields available for filtering: "
+        "dataset, granularity, zone_id, year, month, season, parent_id.",
+        COLLECTION_NAME, persist_dir, len(documents),
     )
-
     return vector_store
 
 
@@ -149,8 +145,10 @@ def load_chroma_index(
         COLLECTION_NAME, persist_dir,
     )
 
+    client = chromadb.Client()
+
     vector_store = Chroma(
-        persist_directory=str(persist_dir),
+        client=client,
         embedding_function=embeddings,
         collection_name=COLLECTION_NAME,
     )

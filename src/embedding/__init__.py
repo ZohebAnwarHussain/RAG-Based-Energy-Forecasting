@@ -29,7 +29,7 @@ Usage:
     )
 """
 
-from src.embedding.chroma_store import build_chroma_index, load_chroma_index
+#from src.embedding.chroma_store import build_chroma_index, load_chroma_index
 from src.embedding.document_loader import load_kb_documents
 from src.embedding.embedder import get_embeddings_model
 from src.embedding.faiss_store import build_faiss_index, load_faiss_index
@@ -39,6 +39,6 @@ __all__ = [
     "get_embeddings_model",
     "build_faiss_index",
     "load_faiss_index",
-    "build_chroma_index",
-    "load_chroma_index",
+#    "build_chroma_index",
+#    "load_chroma_index",
 ]
