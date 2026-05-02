@@ -70,3 +70,20 @@ def get_embeddings_model() -> HuggingFaceEmbeddings:
         "Normalisation: enabled (cosine ≡ inner product)."
     )
     return embeddings
+    
+class Embedder:
+    """Thin wrapper around get_embeddings_model() for experiments that
+    expect a class-based interface."""
+
+    def __init__(self):
+        self._model = get_embeddings_model()
+
+    def embed_query(self, text: str):
+        return self._model.embed_query(text)
+
+    def embed_documents(self, texts):
+        return self._model.embed_documents(texts)
+
+    # Allow passing the Embedder instance directly to LangChain/FAISS
+    def __call__(self, *args, **kwargs):
+        return self._model(*args, **kwargs)
