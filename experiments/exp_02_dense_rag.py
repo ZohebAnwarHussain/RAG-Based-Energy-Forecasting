@@ -28,6 +28,18 @@ Config
   Temperature: 0
   Max tokens : 500
 
+CHANGES (v2)
+------------
+- compute_retrieval_metrics_with_content_fallback() replaces raw
+  _recall_at_k / _precision_at_k / _mrr / _ndcg calls.
+  Reason: 10/200 queries in the golden dataset reference zones not
+  present in the KB (Zone 20, 21) or have label/zone mismatches.
+  Pure ID matching always scores these as 0. Content fallback gives
+  fairer scores when the retriever finds a semantically equivalent chunk.
+- _load_id_to_summary() added at module level so relevant chunk texts
+  are available for the content fallback without re-reading the CSV
+  on every query.
+
 Rate-limit handling
 -------------------
   RotatingGroqClient cycles across up to 6 Groq API keys.
@@ -40,26 +52,26 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from config.models import MODELS, EXP_DEFAULTS
 from config.paths import PATHS
 from src.embedding.embedder import get_embeddings_model
 from src.embedding.faiss_store import load_faiss_index
 from src.retrieval.dense import DenseRetriever
 from src.rag.prompts import format_docs, RAG_PROMPT
-from src.evaluation.retrieval_metrics import (
-    _recall_at_k, _precision_at_k, _mrr, _ndcg,
-)
 from src.evaluation.hallucination import check_hallucination
 from src.experiments.groq_client import RotatingGroqClient
 from src.experiments.metrics import (
-    compute_answer_relevance,
-    compute_semantic_similarity,
-    compute_hallucination_rate,
-    compute_insight_clarity,
-    is_useful_answer,
-)
+        compute_answer_relevance,
+        compute_semantic_similarity,
+        compute_hallucination_rate,
+        compute_insight_clarity,
+        is_useful_answer,
+        compute_retrieval_metrics_with_content_fallback,   # content-fallback fix
+    )
 from experiments.runner import (
-    run_experiment_multi_k,
+    run_experiment,
     ExperimentResult,
     _save_results,
 )
@@ -68,6 +80,34 @@ logger = logging.getLogger(__name__)
 
 EXP_ID   = "EXP_02_DENSE_RAG"
 PIPELINE = "dense"
+
+
+# ---------------------------------------------------------------------------
+# Module-level KB summary lookup (loaded once, used for content fallback)
+# ---------------------------------------------------------------------------
+
+_id_to_summary: dict[str, str] = {}
+
+
+def _load_id_to_summary() -> dict[str, str]:
+    """
+    Load row_id → summary text from combined_master_summaries.csv.
+
+    Used by the content-fallback retrieval metric to compare retrieved
+    chunk text against the text of golden-dataset relevant chunks,
+    handling the ~10 queries whose relevance labels point to zones
+    that do not exactly match the query (Zone 20/21 not in KB, etc.).
+
+    Loaded once at module level; subsequent calls return the cached dict.
+    """
+    global _id_to_summary
+    if _id_to_summary:
+        return _id_to_summary
+    csv_path = PATHS["summaries_csv"] / "combined_master_summaries.csv"
+    df = pd.read_csv(csv_path, usecols=["row_id", "summary"])
+    _id_to_summary = dict(zip(df["row_id"].astype(str), df["summary"].astype(str)))
+    logger.info("Loaded %d KB summaries for retrieval content fallback.", len(_id_to_summary))
+    return _id_to_summary
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +127,24 @@ def _get_faiss_store():
         logger.info("FAISS index loaded.")
     return _faiss_store
 
+_id_to_summary: dict[str, str] = {}
+
+
+def _load_id_to_summary() -> dict[str, str]:
+    \"\"\"
+    Load row_id → summary text for retrieval content-fallback scoring.
+    Handles ~10 queries whose golden-dataset zone labels don't match
+    any KB chunk — pure ID matching always scores these as zero.
+    \"\"\"
+    global _id_to_summary
+    if _id_to_summary:
+        return _id_to_summary
+    csv_path = PATHS["summaries_csv"] / "combined_master_summaries.csv"
+    df = pd.read_csv(csv_path, usecols=["row_id", "summary"])
+    _id_to_summary = dict(zip(df["row_id"].astype(str), df["summary"].astype(str)))
+    logger.info("Loaded %d KB summaries for retrieval content fallback.", len(_id_to_summary))
+    return _id_to_summary
+
 
 # ---------------------------------------------------------------------------
 # Prompt builder
@@ -98,7 +156,6 @@ def _build_messages(context: str, question: str) -> list[dict]:
         context=context,
         question=question,
     )
-    # Convert LangChain messages → plain dicts for RotatingGroqClient
     return [
         {"role": msg.type if msg.type != "human" else "user",
          "content": msg.content}
@@ -116,32 +173,40 @@ def make_generate_fn(client: RotatingGroqClient, k: int) -> Any:
     Closure captures the shared RotatingGroqClient and retriever.
     A fresh DenseRetriever is created per K so k is correctly set.
     """
-    faiss_store = _get_faiss_store()
-    retriever   = DenseRetriever(faiss_store, k=k)
+    faiss_store    = _get_faiss_store()
+    id_to_summary  = _load_id_to_summary()   # loaded once, reused
+    retriever      = DenseRetriever(faiss_store, k=k)
 
     def generate_fn(query: dict, _retrieved_docs: list, top_k: int) -> dict:
-        question     = query.get("question", query.get("user_query", ""))
-        ground_truth = query.get("ground_truth", query.get("reference_answer", ""))
-        expected_ids = _parse_ids(query.get("expected_summary_ids", "[]"))
-        must_include    = _parse_list(query.get("answer_must_include", "[]"))
+        question         = query.get("question", query.get("user_query", ""))
+        ground_truth     = query.get("ground_truth", query.get("reference_answer", ""))
+        expected_ids     = _parse_ids(query.get("expected_summary_ids", "[]"))
+        must_include     = _parse_list(query.get("answer_must_include", "[]"))
         must_not_include = _parse_list(query.get("answer_must_not_include", "[]"))
 
         # ── Retrieval ────────────────────────────────────────────────────
         scored_docs = retriever.retrieve_with_scores(question, k=top_k)
         docs        = retriever.retrieve(question, k=top_k)
 
-        retrieved_ids    = [d["row_id"] for d in scored_docs]
-        similarity_scores = [d["score"]  for d in scored_docs]
+        retrieved_ids     = [d["row_id"] for d in scored_docs]
+        retrieved_texts   = [d.get("page_content", "") for d in scored_docs]
+        similarity_scores = [d["score"] for d in scored_docs]
 
-        # ── Retrieval metrics ────────────────────────────────────────────
-        retrieval_metrics = {
-            "recall_at_k":    round(_recall_at_k(retrieved_ids, expected_ids), 4),
-            "precision_at_k": round(_precision_at_k(retrieved_ids, expected_ids), 4),
-            "mrr":            round(_mrr(retrieved_ids, expected_ids), 4),
-            "ndcg_at_k":      round(_ndcg(retrieved_ids, expected_ids), 4),
-            "relevant_available": len(expected_ids),
-            "relevant_retrieved": len(set(retrieved_ids) & set(expected_ids)),
-        }
+        # Relevant chunk texts for content fallback
+        # (used when a retrieved chunk has no ID match but contains the
+        # right information — e.g. zone label mismatches in golden dataset)
+        relevant_texts = [
+            id_to_summary.get(eid, "") for eid in expected_ids
+        ]
+
+        # ── Retrieval metrics (with content fallback) ─────────────────────
+        retrieval_metrics = compute_retrieval_metrics_with_content_fallback(
+            retrieved_ids   = retrieved_ids,
+            relevant_ids    = expected_ids,
+            k               = top_k,
+            retrieved_texts = retrieved_texts,
+            relevant_texts  = relevant_texts,
+        )
 
         # ── RAG generation ───────────────────────────────────────────────
         context  = format_docs(docs)
@@ -173,14 +238,14 @@ def make_generate_fn(client: RotatingGroqClient, k: int) -> Any:
             "is_useful":           int(is_useful_answer(answer, question)),
             "answer_word_count":   len(answer.split()),
             # Hallucination keyword checks
-            "include_pass":   int(halluc_check["include_pass"]),
-            "exclude_pass":   int(halluc_check["exclude_pass"]),
-            "overall_pass":   int(halluc_check["overall_pass"]),
-            "missing_terms":  json.dumps(halluc_check["missing_terms"]),
-            "forbidden_terms":json.dumps(halluc_check["forbidden_terms"]),
+            "include_pass":    int(halluc_check["include_pass"]),
+            "exclude_pass":    int(halluc_check["exclude_pass"]),
+            "overall_pass":    int(halluc_check["overall_pass"]),
+            "missing_terms":   json.dumps(halluc_check["missing_terms"]),
+            "forbidden_terms": json.dumps(halluc_check["forbidden_terms"]),
             # Retrieval detail
-            "retrieved_ids":       json.dumps(retrieved_ids),
-            "similarity_scores":   json.dumps([round(s, 4) for s in similarity_scores]),
+            "retrieved_ids":      json.dumps(retrieved_ids),
+            "similarity_scores":  json.dumps([round(s, 4) for s in similarity_scores]),
         }
 
         return {
@@ -314,7 +379,6 @@ def run(
         )
         results.append(result)
 
-    # Compute and save aggregate metrics
     _compute_agg(results)
     for result in results:
         out_dir = Path(outputs_dir) / EXP_ID / f"k{result.top_k}"

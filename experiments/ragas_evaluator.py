@@ -8,7 +8,7 @@ Critical compatibility notes
 ------------------------------
 RAGAS 0.4.x has TWO metric namespaces:
   - ragas.metrics.collections  → requires llm_factory (OpenAI/Anthropic ONLY)
-  - ragas.metrics              → works with LangchainLLMWrapper (Groq OK) ✅
+  - ragas.metrics              → works with LangchainLLMWrapper (Groq OK)
 
 We MUST use ragas.metrics (old-style) with .llm assignment pattern.
 DO NOT use ragas.metrics.collections — incompatible with Groq.
@@ -47,6 +47,7 @@ RAGAS_METRIC_COLS = [
     "answer_relevancy",
     "context_precision",
     "context_recall",
+    "semantic_similarity",   # cosine similarity vs reference answer (post-RAGAS, no OpenAI needed)
 ]
 
 BATCH_DELAY = 30.0   # seconds between batches
@@ -57,22 +58,65 @@ BATCH_DELAY = 30.0   # seconds between batches
 # ---------------------------------------------------------------------------
 
 class _KeyRotator:
+    """
+    Round-robin key rotator with TPD exhaustion tracking.
+
+    When a key returns a TPD 429 error, call mark_exhausted(key) to
+    permanently blacklist it for the rest of the session. Subsequent
+    calls to next_key() will skip all blacklisted keys automatically.
+
+    This prevents the second-pass problem where the rotator cycles back
+    to keys that were already exhausted in earlier batches.
+    """
+
     def __init__(self) -> None:
-        self._keys = get_all_groq_keys()
-        self._idx  = 0
+        self._keys      = get_all_groq_keys()
+        self._idx       = 0
+        self._exhausted: set[str] = set()
         logger.info("RAGAS key rotator: %d key(s) available.", len(self._keys))
 
-    def next_key(self) -> str:
-        key = self._keys[self._idx % len(self._keys)]
-        self._idx += 1
-        return key
+    def mark_exhausted(self, key: str) -> None:
+        """Blacklist a key that has hit its TPD limit."""
+        if key not in self._exhausted:
+            self._exhausted.add(key)
+            remaining = len(self._keys) - len(self._exhausted)
+            logger.warning(
+                "Key ...%s marked TPD exhausted. %d/%d keys remaining.",
+                key[-4:], remaining, len(self._keys),
+            )
+            print(
+                f"  Key ...{key[-4:]} TPD exhausted — blacklisted. "
+                f"{remaining}/{len(self._keys)} keys still available.",
+                flush=True,
+            )
+
+    def next_key(self) -> str | None:
+        """
+        Return the next available (non-exhausted) key.
+        Returns None if ALL keys are exhausted.
+        Skips exhausted keys transparently.
+        """
+        n = len(self._keys)
+        for _ in range(n):
+            key = self._keys[self._idx % n]
+            self._idx += 1
+            if key not in self._exhausted:
+                return key
+        # All keys exhausted
+        logger.error("All %d Groq keys are TPD exhausted.", n)
+        return None
 
     @property
     def n_keys(self) -> int:
         return len(self._keys)
 
+    @property
+    def n_available(self) -> int:
+        return len(self._keys) - len(self._exhausted)
+
     def current_label(self) -> str:
-        return f"Key {(self._idx % self.n_keys) + 1}/{self.n_keys}"
+        avail = self.n_available
+        return f"Key {(self._idx % self.n_keys) + 1}/{self.n_keys} ({avail} available)"
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +198,12 @@ def _extract_contexts(row: pd.Series) -> list[str]:
 
 
 def _build_hf_dataset(rows: list[dict], is_no_rag: bool):
-    """Build HuggingFace Dataset for old-style RAGAS evaluate()."""
+    """Build HuggingFace Dataset for old-style RAGAS evaluate().
+
+    semantic_similarity is computed post-RAGAS — 'reference' column no longer needed.
+    We include it for all runs. The metric computes cosine similarity between
+    the generated answer embedding and the reference answer embedding.
+    """
     from datasets import Dataset
     return Dataset.from_dict({
         "question":     [r["question"]                          for r in rows],
@@ -219,11 +268,18 @@ def _run_ragas_04x(
     # Set embeddings on answer_relevancy (only metric that needs them)
     answer_relevancy.embeddings = ragas_embeddings
 
+    # ── SemanticSimilarity is computed post-RAGAS using custom cosine metric ──
+    # ragas.metrics.collections.SemanticSimilarity requires OpenAI modern
+    # embeddings interface which is incompatible with LangchainEmbeddingsWrapper.
+    # semantic_similarity is appended to ragas_scores.csv after RAGAS runs,
+    # using compute_semantic_similarity() from src/experiments/metrics.py
+    # (cosine similarity via all-MiniLM-L6-v2 — same model, same result).
+
     # ── Metrics list ─────────────────────────────────────────────────────────
     if is_no_rag:
         active_metrics = [faithfulness, answer_relevancy]
         logger.info(
-            "No-RAG mode: faithfulness + answer_relevancy only. "
+            "No-RAG mode: faithfulness + answer_relevancy + semantic_similarity only. "
             "context_precision and context_recall will be NaN."
         )
     else:
@@ -249,7 +305,18 @@ def _run_ragas_04x(
         batch_pipes = pipelines[start:end]
 
         # ── Rotate key → build LLM wrapper ───────────────────────────────────
-        key   = rotator.next_key()
+        key = rotator.next_key()
+
+        # All keys exhausted — stop scoring
+        if key is None:
+            print(
+                f"  All keys TPD exhausted at batch {batch_idx + 1}/{n_batches}. "
+                f"Stopping. {len(all_scores) * batch_size} rows scored.",
+                flush=True,
+            )
+            logger.error("All keys exhausted at batch %d.", batch_idx + 1)
+            break
+
         label = rotator.current_label()
         llm   = LangchainLLMWrapper(
             ChatGroq(
@@ -261,7 +328,6 @@ def _run_ragas_04x(
         )
 
         # ── Assign LLM to ALL active metrics ─────────────────────────────────
-        # Old-style metrics use .llm attribute assignment
         for metric in active_metrics:
             metric.llm = llm
 
@@ -290,14 +356,31 @@ def _run_ragas_04x(
             # Normalise column name (RAGAS sometimes returns answer_relevance)
             batch_df = batch_df.rename(columns={
                 "answer_relevance": "answer_relevancy",
+                "semantic_similarity": "semantic_similarity",
             })
 
+            # Check if the batch scored nothing — may indicate TPD exhaustion
+            # even without a raised exception (RAGAS swallows some 429s)
+            n_scored = int(batch_df["faithfulness"].notna().sum()) \
+                if "faithfulness" in batch_df.columns else 0
+            if n_scored == 0 and len(batch_rows) > 0:
+                logger.warning(
+                    "Batch %d scored 0/%d rows — possible silent TPD failure "
+                    "on key ...%s. Marking exhausted.",
+                    batch_idx + 1, len(batch_rows), key[-4:],
+                )
+                rotator.mark_exhausted(key)
+
         except Exception as exc:
+            exc_str = str(exc)
+            # Detect TPD exhaustion in the exception message
+            if "tokens per day" in exc_str.lower() or "tpd" in exc_str.lower():
+                rotator.mark_exhausted(key)
             logger.warning(
                 "RAGAS batch %d failed: %s — NaN for this batch.",
                 batch_idx + 1, exc,
             )
-            print(f"  ⚠️  Batch failed: {exc}", flush=True)
+            print(f"  Batch {batch_idx + 1} failed: {exc_str[:120]}", flush=True)
             batch_df = pd.DataFrame([
                 {col: float("nan") for col in RAGAS_METRIC_COLS}
                 for _ in batch_rows
@@ -316,10 +399,10 @@ def _run_ragas_04x(
         combined = pd.concat(all_scores, ignore_index=True)
         combined.to_csv(output_path, index=False)
         n_valid = int(combined["faithfulness"].notna().sum())
-        print(f"  ✅ {n_valid}/{len(combined)} rows scored so far", flush=True)
+        print(f"  {n_valid}/{len(combined)} rows scored so far", flush=True)
 
         if batch_idx < n_batches - 1:
-            print(f"  ⏳ Waiting {BATCH_DELAY:.0f}s...", flush=True)
+            print(f"   Waiting {BATCH_DELAY:.0f}s...", flush=True)
             time.sleep(BATCH_DELAY)
 
     final_df = pd.concat(all_scores, ignore_index=True)
@@ -330,6 +413,31 @@ def _run_ragas_04x(
             final_df[col] = float("nan")
         logger.info("context_precision/recall set to NaN (No-RAG).")
 
+    # ── Semantic Similarity — computed post-RAGAS via cosine similarity ───────
+    # Uses compute_semantic_similarity() from src/experiments/metrics.py
+    # which applies all-MiniLM-L6-v2 cosine similarity between answer and
+    # ground_truth. This is semantically equivalent to RAGAS SemanticSimilarity
+    # but works with LangchainEmbeddingsWrapper (no OpenAI required).
+    try:
+        from src.experiments.metrics import compute_semantic_similarity
+        sem_scores = []
+        for _, row in final_df.iterrows():
+            answer       = str(row.get("answer", "") or "")
+            ground_truth = str(row.get("ground_truth", "") or "")
+            if answer and ground_truth:
+                score = compute_semantic_similarity(answer, ground_truth)
+            else:
+                score = float("nan")
+            sem_scores.append(score)
+        final_df["semantic_similarity"] = sem_scores
+        valid_sem = sum(1 for s in sem_scores if s is not None and s == s)
+        logger.info(
+            "Semantic similarity computed: %d/%d valid rows.",
+            valid_sem, len(final_df),
+        )
+    except Exception as exc:
+        logger.warning("Semantic similarity computation failed: %s", exc)
+        final_df["semantic_similarity"] = float("nan")
     final_df.to_csv(output_path, index=False)
     return final_df
 
@@ -482,8 +590,8 @@ def _log_summary(scores_df: pd.DataFrame, exp_id: str, top_k: int) -> None:
             n_valid = len(vals)
             n_total = len(scores_df)
             mean    = vals.mean() if n_valid > 0 else float("nan")
-            flag    = "⚠️ " if n_valid < n_total * 0.9 else "✅"
-            print(f"  {flag} {col:25s}: {mean:.4f}  ({n_valid}/{n_total} valid)")
+            flag    = "WARN" if n_valid < n_total * 0.9 else "OK  "
+            print(f"  [{flag}] {col:25s}: {mean:.4f}  ({n_valid}/{n_total} valid)")
         else:
-            print(f"  ❌ {col:25s}: not computed")
+            print(f"  [MISS] {col:25s}: not computed")
     print(f"{'='*60}\n")

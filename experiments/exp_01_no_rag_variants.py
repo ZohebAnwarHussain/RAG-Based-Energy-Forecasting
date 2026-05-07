@@ -57,12 +57,13 @@ from typing import Any
 from config.models import MODELS, EXP_DEFAULTS
 from src.experiments.groq_client import RotatingGroqClient
 from src.experiments.metrics import (
-    compute_answer_relevance,
-    compute_semantic_similarity,
-    compute_hallucination_rate,
-    compute_insight_clarity,
-    is_useful_answer,
-)
+        compute_answer_relevance,
+        compute_semantic_similarity,
+        compute_hallucination_rate,
+        compute_insight_clarity,
+        is_useful_answer,
+        compute_retrieval_metrics_with_content_fallback,   # content-fallback fix
+    )
 from experiments.runner import run_experiment, ExperimentResult, _save_results
 
 logger = logging.getLogger(__name__)

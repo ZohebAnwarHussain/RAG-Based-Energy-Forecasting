@@ -32,12 +32,13 @@ from src.evaluation.retrieval_metrics import (
 )
 from src.evaluation.hallucination import check_hallucination
 from src.experiments.metrics import (
-    compute_answer_relevance,
-    compute_semantic_similarity,
-    compute_hallucination_rate,
-    compute_insight_clarity,
-    is_useful_answer,
-)
+        compute_answer_relevance,
+        compute_semantic_similarity,
+        compute_hallucination_rate,
+        compute_insight_clarity,
+        is_useful_answer,
+        compute_retrieval_metrics_with_content_fallback,   # content-fallback fix
+    )
 from src.rag.prompts import RAG_PROMPT, format_docs
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,29 @@ logger = logging.getLogger(__name__)
 EXP_ID    = "EXP_03_HYBRID_RAG"
 PIPELINE  = "hybrid_rag"
 FAISS_DIR = PATHS["faiss_index"]
+
+
+# ---------------------------------------------------------------------------
+# Module-level KB summary lookup (loaded once, used for content fallback)
+# ---------------------------------------------------------------------------
+
+_id_to_summary: dict[str, str] = {}
+
+
+def _load_id_to_summary() -> dict[str, str]:
+    """
+    Load row_id -> summary text for retrieval content-fallback scoring.
+    Handles ~10 queries whose golden-dataset zone labels don't match
+    any KB chunk -- pure ID matching always scores these as zero.
+    """
+    global _id_to_summary
+    if _id_to_summary:
+        return _id_to_summary
+    csv_path = PATHS["summaries_csv"] / "combined_master_summaries.csv"
+    df = pd.read_csv(csv_path, usecols=["row_id", "summary"])
+    _id_to_summary = dict(zip(df["row_id"].astype(str), df["summary"].astype(str)))
+    logger.info("Loaded %d KB summaries for retrieval content fallback.", len(_id_to_summary))
+    return _id_to_summary
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +175,8 @@ def _parse_list(raw) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _make_generate_fn(groq: RotatingGroqClient, retriever: HybridRetriever):
+    id_to_summary = _load_id_to_summary()   # loaded once, reused
+
     def generate_fn(query_row: dict, _docs: list[dict], top_k: int) -> dict:
         question         = query_row.get("question", query_row.get("user_query", ""))
         ground_truth     = query_row.get("ground_truth", query_row.get("reference_answer", ""))
@@ -163,14 +189,17 @@ def _make_generate_fn(groq: RotatingGroqClient, retriever: HybridRetriever):
         retrieved_ids = [d["row_id"] for d in retrieved]
         scores        = [d["score"]  for d in retrieved]
 
-        retrieval_metrics = {
-            "recall_at_k":        round(_recall_at_k(retrieved_ids, expected_ids), 4),
-            "precision_at_k":     round(_precision_at_k(retrieved_ids, expected_ids), 4),
-            "mrr":                round(_mrr(retrieved_ids, expected_ids), 4),
-            "ndcg_at_k":          round(_ndcg(retrieved_ids, expected_ids), 4),
-            "relevant_available": len(expected_ids),
-            "relevant_retrieved": len(set(retrieved_ids) & set(expected_ids)),
-        }
+        # Relevant chunk texts for content fallback
+        retrieved_texts = [d.get("text", "") for d in retrieved]
+        relevant_texts  = [id_to_summary.get(eid, "") for eid in expected_ids]
+
+        retrieval_metrics = compute_retrieval_metrics_with_content_fallback(
+            retrieved_ids   = retrieved_ids,
+            relevant_ids    = expected_ids,
+            k               = top_k,
+            retrieved_texts = retrieved_texts,
+            relevant_texts  = relevant_texts,
+        )
 
         # Generation
         context  = format_docs(retriever.retrieve_as_documents(question))

@@ -46,7 +46,7 @@ def get_all_groq_keys() -> list[str]:
     """
     keys: list[str] = []
 
-    for i in range(1, 13):
+    for i in range(1, 38):
         val = os.getenv(f"GROQ_API_KEY_{i}", "").strip()
         if val and not val.startswith("your_"):
             keys.append(val)
