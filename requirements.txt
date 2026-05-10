@@ -1,0 +1,51 @@
+# RAG-Based Energy Forecasting - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Environment / secrets
+python-dotenv>=1.0.0
+
+# Knowledge base generation (Gemini)
+google-genai>=1.0.0
+
+# Embeddings and vector store
+sentence-transformers>=3.0.0
+faiss-cpu>=1.7.0
+
+# RAG retrieval
+rank-bm25>=0.3.1
+
+# Reranking (cross-encoder)
+# Uses sentence-transformers CrossEncoder internally
+
+# LLM generation (Groq)
+groq>=0.11.0
+
+# LangChain (RAG chain, document handling, FAISS wrapper)
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-groq>=0.2.0
+langchain-core>=0.3.0,<0.3.70
+
+# RAGAS evaluation
+ragas>=0.2.0
+
+# HTTP client (Groq key checker)
+httpx>=0.25.0
+
+# Excel report generation
+openpyxl>=3.1.0
+
+# PDF documentation generation
+reportlab>=4.0.0
+
+# Testing
+pytest>=8.0.0
+
+# Jupyter notebooks
+jupyter>=1.0.0
+ipykernel>=6.0.0

@@ -1,13 +1,13 @@
 """
 config/groq_keys.py
 ====================
-Loads all 6 Groq API keys from .env and exposes them as a list.
+Loads all 46 Groq API keys from .env and exposes them as a list.
 
 Used exclusively by src/experiments/groq_client.py (the rotation engine).
 Nothing else should import from here directly — use RotatingGroqClient instead.
 
 Keys are stored as:
-    GROQ_API_KEY_1 ... GROQ_API_KEY_6
+    GROQ_API_KEY_1 ... GROQ_API_KEY_46
 in your .env file.
 """
 
@@ -46,7 +46,7 @@ def get_all_groq_keys() -> list[str]:
     """
     keys: list[str] = []
 
-    for i in range(1, 38):
+    for i in range(1, 47):
         val = os.getenv(f"GROQ_API_KEY_{i}", "").strip()
         if val and not val.startswith("your_"):
             keys.append(val)

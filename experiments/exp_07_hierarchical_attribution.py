@@ -291,15 +291,10 @@ def make_generate_fn(
         else:
             child_docs = child_docs_raw[:top_k]
 
-        # Re-filter parents to those belonging to kept children
-        kept_parent_ids = {
-            d.get("parent_id", "") or d.get("metadata", {}).get("parent_id", "")
-            for d in child_docs
-        }
-        parent_docs = (
-            [d for d in parent_docs_raw if d["row_id"] in kept_parent_ids]
-            if any(kept_parent_ids) else parent_docs_raw
-        )
+        # Keep all parents from retrieve_with_scores — both exact and semantic fallback.
+        # Do NOT re-filter by child parent_id field: semantic fallback parents have
+        # different row_ids from the children's parent_id field by design.
+        parent_docs = parent_docs_raw
 
         child_ids    = [d["row_id"] for d in child_docs]
         child_scores = [d.get("rerank_score", d.get("score", 0.0)) for d in child_docs]

@@ -250,18 +250,10 @@ def make_generate_fn(
 
         # Parent docs stay as-is (resolved from top children by HierarchicalRetriever)
         # Re-filter parents to only those belonging to the kept children's parent_ids
-        kept_parent_ids = {
-            d.get("parent_id", "") or d.get("metadata", {}).get("parent_id", "")
-            for d in child_docs
-        }
-        # If parent filtering is available, apply it; otherwise keep all
-        if kept_parent_ids and any(kept_parent_ids):
-            parent_docs = [
-                d for d in parent_docs_raw
-                if d["row_id"] in kept_parent_ids
-            ]
-        else:
-            parent_docs = parent_docs_raw
+        # Keep all parents from retrieve_with_scores — both exact and semantic fallback.
+        # Do NOT re-filter by child parent_id field: semantic fallback parents have
+        # different row_ids from the children's parent_id field by design.
+        parent_docs = parent_docs_raw
 
         final_all_docs  = child_docs + parent_docs
         child_ids       = [d["row_id"] for d in child_docs]

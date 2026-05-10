@@ -50,7 +50,7 @@ RAGAS_METRIC_COLS = [
     "semantic_similarity",   # cosine similarity vs reference answer (post-RAGAS, no OpenAI needed)
 ]
 
-BATCH_DELAY = 30.0   # seconds between batches
+BATCH_DELAY = 10.0   # seconds between batches (key rotation handles TPD)
 
 
 # ---------------------------------------------------------------------------
@@ -446,16 +446,74 @@ def _run_ragas_04x(
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def _stratified_subsample(
+    ragas_rows: list[dict],
+    golden_ids: list[str],
+    pipelines:  list[str],
+    max_rows:   int,
+    seed:       int = 42,
+) -> tuple[list[dict], list[str], list[str]]:
+    """Select a stratified subsample for RAGAS scoring.
+
+    Picks rows evenly across the dataset to ensure the subsample
+    represents the full query distribution rather than being biased
+    toward early queries. Uses deterministic selection for reproducibility.
+
+    Args:
+        ragas_rows: Full list of RAGAS row dicts.
+        golden_ids: Corresponding golden IDs.
+        pipelines:  Corresponding pipeline labels.
+        max_rows:   Maximum rows to keep.
+        seed:       Random seed for reproducibility.
+
+    Returns:
+        Subsampled (ragas_rows, golden_ids, pipelines) tuple.
+    """
+    import random
+    n = len(ragas_rows)
+    if n <= max_rows:
+        return ragas_rows, golden_ids, pipelines
+
+    rng = random.Random(seed)
+    indices = sorted(rng.sample(range(n), max_rows))
+
+    sub_rows  = [ragas_rows[i]  for i in indices]
+    sub_gids  = [golden_ids[i]  for i in indices]
+    sub_pipes = [pipelines[i]   for i in indices]
+
+    logger.info(
+        "RAGAS subsample: %d → %d rows (seed=%d).",
+        n, max_rows, seed,
+    )
+    print(
+        f"  Subsampled {n} → {max_rows} rows for RAGAS scoring.",
+        flush=True,
+    )
+    return sub_rows, sub_gids, sub_pipes
+
+
 def run_ragas_for_experiment(
     exp_id:      str,
     top_k:       int,
     golden_df:   pd.DataFrame,
     outputs_dir: str | Path = "outputs/experiments",
     batch_size:  int  = 5,
+    max_rows:    int | None = None,
     force_rerun: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     Run RAGAS evaluation for one experiment at one K value.
+
+    Args:
+        exp_id:      Experiment identifier (e.g. 'EXP_02_DENSE_RAG').
+        top_k:       K value (0 for no-RAG experiments).
+        golden_df:   Golden dataset DataFrame.
+        outputs_dir: Base directory for experiment outputs.
+        batch_size:  Rows per RAGAS batch (default 5).
+        max_rows:    Maximum rows to score. If set, a stratified
+                     subsample is drawn for RAGAS evaluation. Use 50
+                     for token-constrained runs. None scores all rows.
+        force_rerun: If True, re-scores even if ragas_scores.csv exists.
 
     Reads  : outputs/experiments/{exp_id}/k{top_k}/query_results.csv
     Saves  : outputs/experiments/{exp_id}/k{top_k}/ragas_scores.csv
@@ -482,9 +540,10 @@ def run_ragas_for_experiment(
             return existing
         logger.info("Partial scores (%d/%d) — re-running.", n_valid, total)
 
+    sample_note = f" | max_rows={max_rows}" if max_rows else ""
     print(f"\n{'='*60}")
     print(f"  RAGAS: {exp_id} | K={top_k}")
-    print(f"  batch_size={batch_size} | delay={BATCH_DELAY:.0f}s | no_rag={is_no_rag}")
+    print(f"  batch_size={batch_size} | delay={BATCH_DELAY:.0f}s | no_rag={is_no_rag}{sample_note}")
     print(f"{'='*60}")
 
     results_df = _load_experiment_results(exp_dir)
@@ -493,6 +552,12 @@ def run_ragas_for_experiment(
     if not ragas_rows:
         logger.error("No valid rows for %s k=%d", exp_id, top_k)
         return None
+
+    # Subsample if max_rows is set (token-constrained RAGAS runs)
+    if max_rows is not None and len(ragas_rows) > max_rows:
+        ragas_rows, golden_ids, pipelines = _stratified_subsample(
+            ragas_rows, golden_ids, pipelines, max_rows,
+        )
 
     scores_df = _run_ragas_04x(
         ragas_rows=ragas_rows,
@@ -514,6 +579,7 @@ def run_ragas_for_all_k(
     k_values:    list[int] | None = None,
     outputs_dir: str | Path = "outputs/experiments",
     batch_size:  int  = 5,
+    max_rows:    int | None = None,
     force_rerun: bool = False,
 ) -> dict[int, pd.DataFrame]:
     if k_values is None:
@@ -523,7 +589,7 @@ def run_ragas_for_all_k(
         scores = run_ragas_for_experiment(
             exp_id=exp_id, top_k=k, golden_df=golden_df,
             outputs_dir=outputs_dir, batch_size=batch_size,
-            force_rerun=force_rerun,
+            max_rows=max_rows, force_rerun=force_rerun,
         )
         if scores is not None:
             results[k] = scores
@@ -537,6 +603,7 @@ def run_ragas_for_experiments(
     golden_df:   pd.DataFrame,
     outputs_dir: str | Path = "outputs/experiments",
     batch_size:  int  = 5,
+    max_rows:    int | None = None,
     force_rerun: bool = False,
 ) -> dict[str, dict[int, pd.DataFrame]]:
     all_results = {}
@@ -545,7 +612,7 @@ def run_ragas_for_experiments(
         all_results[exp_id] = run_ragas_for_all_k(
             exp_id=exp_id, golden_df=golden_df, k_values=k_values,
             outputs_dir=outputs_dir, batch_size=batch_size,
-            force_rerun=force_rerun,
+            max_rows=max_rows, force_rerun=force_rerun,
         )
         time.sleep(10)
     return all_results

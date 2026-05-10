@@ -127,24 +127,6 @@ def _get_faiss_store():
         logger.info("FAISS index loaded.")
     return _faiss_store
 
-_id_to_summary: dict[str, str] = {}
-
-
-def _load_id_to_summary() -> dict[str, str]:
-    \"\"\"
-    Load row_id → summary text for retrieval content-fallback scoring.
-    Handles ~10 queries whose golden-dataset zone labels don't match
-    any KB chunk — pure ID matching always scores these as zero.
-    \"\"\"
-    global _id_to_summary
-    if _id_to_summary:
-        return _id_to_summary
-    csv_path = PATHS["summaries_csv"] / "combined_master_summaries.csv"
-    df = pd.read_csv(csv_path, usecols=["row_id", "summary"])
-    _id_to_summary = dict(zip(df["row_id"].astype(str), df["summary"].astype(str)))
-    logger.info("Loaded %d KB summaries for retrieval content fallback.", len(_id_to_summary))
-    return _id_to_summary
-
 
 # ---------------------------------------------------------------------------
 # Prompt builder
@@ -391,9 +373,3 @@ def run(
 
     client.log_stats()
     return results
-
-
-# ---------------------------------------------------------------------------
-# Required import (kept here to avoid circular at module level)
-# ---------------------------------------------------------------------------
-from experiments.runner import run_experiment  # noqa: E402

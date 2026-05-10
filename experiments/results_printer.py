@@ -44,16 +44,7 @@ Columns in the table (matching your thesis Table 1 + Table 2 layout):
   Precision @ K
   MRR
   nDCG @ K
-  Observation                ← auto-generated from the numbers
-
-OBSERVATION LOGIC
------------------
-The Observation column is auto-generated per row using a set of rules
-that compare each metric against expected thresholds and flag notable
-patterns. It is intentionally concise (1–2 sentences) for thesis tables.
-You can override any observation by passing obs_overrides={}.
 """
-
 from __future__ import annotations
 
 import json
@@ -140,117 +131,6 @@ def _safe(val, fmt=".4f", pct=False, missing="—") -> str:
     except (TypeError, ValueError):
         return str(val) if val else missing
 
-
-# ---------------------------------------------------------------------------
-# Observation generator
-# ---------------------------------------------------------------------------
-
-def _generate_observation(row: dict) -> str:
-    """
-    Auto-generate a 1-2 sentence observation for the table row
-    based on the metric values. Logic is intentionally heuristic —
-    override with obs_overrides where needed.
-    """
-    parts = []
-    exp_id  = row.get("exp_id", "")
-    faith   = row.get("faithfulness")
-    halluc  = row.get("hallucination_rate")
-    recall  = row.get("recall_at_k")
-    cp      = row.get("context_precision")
-    cr      = row.get("context_recall")
-    ans_rel = row.get("avg_answer_relevance")
-
-    # --- No-RAG baseline ---
-    if "NO_RAG" in exp_id or row.get("k") == 0:
-        parts.append("No grounding — model answers from memory only.")
-        if ans_rel and float(ans_rel) > 0.80:
-            parts.append(f"High answer relevance ({_safe(ans_rel)}) confirms strong parametric knowledge.")
-        return " ".join(parts)
-
-    # --- Faithfulness ---
-    if faith is not None and not np.isnan(float(faith)):
-        f = float(faith)
-        if f == 0.0:
-            parts.append("Zero faithfulness — model does not ground responses in retrieved context.")
-        elif f < 0.15:
-            parts.append(f"Very low faithfulness ({_safe(faith)}) — most claims not supported by retrieved docs.")
-        elif f < 0.30:
-            parts.append(f"Low faithfulness ({_safe(faith)}) — partial grounding; retrieval quality limits improvement.")
-        elif f < 0.50:
-            parts.append(f"Moderate faithfulness ({_safe(faith)}) — reasonable grounding given KB size.")
-        else:
-            parts.append(f"Good faithfulness ({_safe(faith)}) — majority of claims supported by retrieved context.")
-    else:
-        parts.append("Faithfulness not yet scored (RAGAS pending).")
-
-    # --- Hallucination ---
-    if halluc is not None:
-        h = float(halluc)
-        if h < 0.10:
-            parts.append(f"Low hallucination rate ({h*100:.1f}%).")
-        elif h < 0.25:
-            parts.append(f"Hallucination rate {h*100:.1f}% — improvement over no-RAG baseline.")
-        else:
-            parts.append(f"Hallucination rate {h*100:.1f}% — retrieval noise contributing to confabulation.")
-
-    # --- Retrieval ---
-    if recall is not None:
-        r = float(recall)
-        if r < 0.05:
-            parts.append(f"Very low Recall@K ({_safe(recall)}) — retrieval failing to surface relevant docs.")
-        elif r < 0.15:
-            parts.append(f"Recall@K {_safe(recall)} — limited retrieval coverage.")
-        elif r < 0.30:
-            parts.append(f"Recall@K {_safe(recall)} — moderate retrieval coverage.")
-        else:
-            parts.append(f"Recall@K {_safe(recall)} — strong retrieval coverage.")
-
-    # --- Context Precision ---
-    if cp is not None and not np.isnan(float(cp)):
-        c = float(cp)
-        if c == 0.0:
-            parts.append("Context Precision = 0 — top-ranked retrieved docs are not ground-truth relevant.")
-        elif c < 0.10:
-            parts.append(f"Context Precision {_safe(cp)} — ranking quality still poor despite retrieval recall.")
-
-    # Novelty 1 -- Attribution
-    attr_cov  = row.get("attribution_coverage")
-    cite_acc  = row.get("citation_accuracy")
-    unsup     = row.get("unsupported_claim_rate")
-    if attr_cov is not None:
-        ac = float(attr_cov)
-        if ac >= 0.85:
-            parts.append(f"Attribution coverage {ac*100:.0f}% — strong citation discipline.")
-        elif ac >= 0.60:
-            parts.append(f"Attribution coverage {ac*100:.0f}% — most claims cited.")
-        else:
-            parts.append(f"Low attribution coverage {ac*100:.0f}% — many uncited claims.")
-    if cite_acc is not None:
-        ca = float(cite_acc)
-        if ca < 0.80:
-            parts.append(f"Citation accuracy {ca*100:.0f}% — some citations reference non-existent evidence IDs.")
-
-    # Novelty 2 -- Difficulty
-    caut = row.get("cautious_response_accuracy")
-    cov_sc = row.get("coverage_score")
-    n_hard = row.get("n_hard")
-    if cov_sc is not None:
-        cs = float(cov_sc)
-        if cs < 0.40:
-            parts.append(f"Low coverage score ({_safe(cov_sc)}) — many queries lack historical evidence.")
-        elif cs >= 0.70:
-            parts.append(f"Good coverage score ({_safe(cov_sc)}) — queries well-supported by KB.")
-    if caut is not None and n_hard:
-        ca = float(caut)
-        if ca >= 0.80:
-            parts.append(f"Cautious response accuracy {ca*100:.0f}% on {n_hard} hard queries — model signals uncertainty correctly.")
-        elif ca < 0.50:
-            parts.append(f"Cautious response accuracy {ca*100:.0f}% — hard queries not reliably flagged with uncertainty.")
-
-    # Truncate to 2 sentences max for table readability
-    sentences = " ".join(parts)
-    split = [s.strip() for s in sentences.split(". ") if s.strip()]
-    return ". ".join(split[:2]) + ("." if split and not split[-1].endswith(".") else "")
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +232,6 @@ def _build_row(
     obs_key = f"{exp_id}_k{k}"
     if obs_overrides and obs_key in obs_overrides:
         row["observation"] = obs_overrides[obs_key]
-    else:
-        row["observation"] = _generate_observation(row)
 
     return row
 
@@ -571,7 +449,6 @@ def _render_html_table(df: pd.DataFrame, title: str = "") -> str:
             ("Cautious Acc.",  "center", "cautious_response_accuracy"),
         ]
 
-    headers += [("Observation", "left", None)]
 
     html = [_TABLE_CSS]
     if title:
@@ -648,7 +525,6 @@ def _render_html_table(df: pd.DataFrame, title: str = "") -> str:
                 (_safe(row.get("cautious_response_accuracy")), "center", "cautious_response_accuracy"),
             ]
 
-        cells += [(row.get("observation", ""), "obs", None)]
 
         html.append("<tr>")
         for val_str, align, col_key in cells:
@@ -817,7 +693,6 @@ def _display_or_print(df: pd.DataFrame, title: str = "") -> None:
             "attribution_coverage", "citation_accuracy", "unsupported_claim_rate",
             "coverage_score", "consistency_score", "cautious_response_accuracy",
             "avg_n_children", "avg_n_parents_added",
-            "observation",
         ]
         available = [c for c in display_cols if c in df.columns]
         print(f"\n{title}")

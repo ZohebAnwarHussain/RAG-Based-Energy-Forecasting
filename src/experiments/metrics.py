@@ -1,7 +1,7 @@
 """
 src/experiments/metrics.py
 ============================
-Per-query metric computation functions shared across all experiments.
+Per query metric computation functions shared across all experiments.
 
 Functions
 ---------
